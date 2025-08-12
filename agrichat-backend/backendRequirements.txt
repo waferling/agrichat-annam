@@ -6,10 +6,8 @@ requests
 langchain
 langchain-community
 chromadb
-ollama
 beautifulsoup4
 markdown
-openai
 numpy
 python-multipart
 gunicorn
@@ -18,3 +16,5 @@ google.generativeai
 certifi
 pytz
 python-dateutil
+crewai
+firecrawl-py
