@@ -1,9 +1,9 @@
-from firecrawl import FirecrawlApp, ScrapeOptions
-from pydantic import PrivateAttr
+
+from pydantic import PrivateAttr, BaseModel, Field
 from crewai.tools import BaseTool
-import google.generativeai as genai
 from chroma_query_handler import ChromaQueryHandler
 from typing import ClassVar, List, Dict, Optional
+from local_llm_interface import run_local_llm
 import os
 import csv
 from datetime import datetime
@@ -24,49 +24,62 @@ def log_fallback_to_csv(question: str, answer: str, csv_file: str = "fallback_qu
 
 
 class FireCrawlWebSearchTool(BaseTool):
-    def __init__(self, api_key: str):
-        super().__init__(name="FireCrawlWebSearchTool", description="Performs web search using Firecrawl API and returns markdown results.")
-        object.__setattr__(self, 'app', FirecrawlApp(api_key=api_key))
-        object.__setattr__(self, 'ScrapeOptions', ScrapeOptions)
+    pass
 
-    def _run(self, query: str, limit: int = 2) -> str:
-        scrape_options = self.ScrapeOptions(formats=["markdown"])
-        search_result = self.app.search(query, limit=limit, scrape_options=scrape_options)
-        combined_markdown = "\n\n".join([item.get("markdown", "") for item in search_result.data])
-        return combined_markdown if combined_markdown else "No relevant web search results found."
+
+class RAGToolSchema(BaseModel):
+    question: str = Field(description="The user's question")
+    conversation_history: Optional[List[Dict]] = Field(default=None, description="Previous conversation history")
+    user_state: str = Field(default="", description="User's state/region")
 
 
 class RAGTool(BaseTool):
     _handler: any = PrivateAttr()
     _classifier: any = PrivateAttr()
+    args_schema = RAGToolSchema
 
-    def __init__(self, chroma_path, gemini_api_key, **kwargs):
+    def __init__(self, chroma_path, **kwargs):
         super().__init__(
             name="rag_tool",
-            description="Retrieval-Augmented Generation tool using ChromaDB and Gemini API.",
+            description="Retrieval-Augmented Generation tool using ChromaDB.",
             **kwargs
         )
-        self._handler = ChromaQueryHandler(chroma_path, gemini_api_key)
+        self._handler = ChromaQueryHandler(chroma_path)
 
-    def _run(self, question: str, conversation_history: Optional[List[Dict]] = None) -> str:
+    def _run(self, question: str, conversation_history: Optional[List[Dict]] = None, user_state: str = "") -> str:
         """
-        Run RAG tool with optional conversation history for context-aware responses
+        Run RAG tool with improved fallback detection
         
         Args:
             question: Current user question
             conversation_history: List of previous Q&A pairs for context
+            user_state: User's state/region detected from frontend
             
         Returns:
-            Generated response with appropriate source attribution
+            Generated response with appropriate source attribution or __FALLBACK__ indicator
         """
-        answer = self._handler.get_answer(question, conversation_history)
+        print(f"[DEBUG] RAGTool._run called with:")
+        print(f"  question: {question}")
+        print(f"  conversation_history: {conversation_history}")
+        print(f"  user_state: {user_state}")
+        
+        import inspect
+        sig = inspect.signature(self._handler.get_answer)
+        print(f"[DEBUG] get_answer signature: {sig}")
+        
+        answer = self._handler.get_answer(question, conversation_history, user_state)
+        
+        if answer.startswith("__FALLBACK__"):
+            log_fallback_to_csv(question, "Database search failed - using LLM fallback", "fallback_queries.csv")
+            return "__FALLBACK__"
+        
         if answer.strip() == "I don't have enough information to answer that.":
             return "__FALLBACK__"
         
         if answer.startswith("__NO_SOURCE__"):
             return answer.replace("__NO_SOURCE__", "")
         
-        return "Source: RAG Database\n\n" + answer
+        return answer
     
     def run_with_context(self, question: str, conversation_history: List[Dict]) -> str:
         """
@@ -74,97 +87,113 @@ class RAGTool(BaseTool):
         """
         return self._run(question, conversation_history)
 
+
+class FallbackAgriToolSchema(BaseModel):
+    question: str = Field(description="The user's question")
+    conversation_history: Optional[List[Dict]] = Field(default=None, description="Previous conversation history")
+
+
 class FallbackAgriTool(BaseTool):
-    _llm_model: any = PrivateAttr()
-    _websearch_tool: any = PrivateAttr()
     _classifier: any = PrivateAttr()
+    args_schema = FallbackAgriToolSchema
 
     FALLBACK_PROMPT: ClassVar[str] = """
-You are an expert agricultural assistant. Use your own expert knowledge and review any web search information provided to answer the user's agricultural question. If the question is a normal greeting or salutation (e.g., “hello,” “how are you?”, “good morning”), respond gently and politely—don’t refuse, but give a soft, appropriate answer. Do NOT answer non-agricultural queries except for such greetings.
+You are an expert agricultural assistant specializing in Indian agriculture and farming practices. Focus exclusively on Indian context, regional conditions, and India-specific agricultural solutions. Use your expert knowledge to answer agricultural questions relevant to Indian farmers, soil conditions, climate patterns, and crop varieties suited to different Indian states and regions.
 
-- Give detailed, step-by-step advice and structure your answer with bullet points, headings, or tables when appropriate.
-- Stick strictly to the user's topic; do not introduce unrelated information.
-- If the web search results are not relevant, do not use them.
-- If the web search results are relevant, incorporate them into your answer.
-- Always provide sources for your information (LLM knowledge and/or web-based crawl/search).
-- Keep the response concise, focused, and do not provide any preamble or explanations except for the final answer.
+IMPORTANT: All responses must be specific to Indian agricultural context, Indian crop varieties, Indian soil types, Indian climate conditions, and farming practices suitable for Indian farmers.
 
-### Detailed Explanation
-- Provide a comprehensive, step-by-step explanation using both the web/context and your own agricultural knowledge, but only as it directly relates to the user's question.
-- Use bullet points, sub-headings, or tables to clarify complex information.
-- Reference and explain all relevant data points from the context or web.
-- Briefly define technical terms inline if needed.
-- Avoid detailed botanical or scientific explanations not relevant to farmers unless explicitly asked.
+- When providing advice, always consider Indian monsoon patterns, soil types common in India, and crop varieties developed for Indian conditions.
+- Reference Indian agricultural practices, local farming techniques, and solutions available to Indian farmers.
+- For fertilizers, pesticides, and agricultural inputs, focus on products and brands available in Indian markets.
+- Consider regional variations within India (North Indian plains, South Indian conditions, coastal regions, hill states, etc.).
 
-### Special Instructions for Disease, Fertilizer, Fungicide, or Tonic Queries
-- Whenever a question relates to disease, pest attacks, fertilizers, fungicides, plant tonics, or similar agricultural inputs—even if not explicitly stated—include:
+If the question is a normal greeting or salutation (e.g., "hello," "how are you?", "good morning"), respond gently and politely—don't refuse, but give a soft, appropriate answer. Do NOT answer non-agricultural queries except for such greetings.
 
-    -Standard recommendations (chemical fertilizers, fungicides, plant protection chemicals).
-    -Quick, low-cost household/natural solutions suitable for farmers seeking alternatives.
+- Give detailed, step-by-step advice specific to Indian farming conditions and structure your answer with bullet points, headings, or tables when appropriate.
+- Stick strictly to the user's topic within Indian agricultural context; do not introduce unrelated information.
+- Always provide sources for your information (LLM knowledge or database) and specify if advice is for Indian conditions.
+- Keep the response concise, focused on Indian agriculture, and do not provide any preamble or explanations except for the final answer.
 
-- For each method, explain when/why it may be preferable, with any relevant precautions.
-- Always offer both professional and practical (DIY) solutions unless the question strictly forbids one or the other.
+### Detailed Explanation (India-Specific)
+- Provide comprehensive, step-by-step explanations using Indian agricultural knowledge and practices that work in Indian climate and soil conditions.
+- Reference Indian crop varieties, local farming methods, and region-specific practices.
+- Use bullet points, sub-headings, or tables to clarify complex information relevant to Indian farmers.
+- Reference Indian agricultural research institutes (ICAR, state agricultural universities) when relevant.
+- Consider Indian farming seasons (Kharif, Rabi, Zaid) and monsoon patterns in your advice.
+- Briefly define technical terms inline if needed, using Indian context and examples.
 
-### Additional Guidance for General Crop Management Questions (e.g., maximizing yield, disease prevention, precautions)
-- If a general question is asked about growing a specific crop and the database contains information for that crop, analyze the context of the user’s question (such as disease prevention, yield maximization, or best practices).
-- Retrieve and provide all relevant guidance from existing sources about that crop, including:
+### Special Instructions for Disease, Fertilizer, Fungicide, or Tonic Queries (Indian Context)
+- For questions about diseases, pest attacks, fertilizers, fungicides, plant tonics, or agricultural inputs:
+    - Provide standard recommendations using products and chemicals available in Indian markets
+    - Include quick, low-cost household/natural solutions suitable for Indian farmers and readily available Indian materials
+    - Consider Indian organic farming practices and traditional Indian agricultural methods
+    - Reference Indian brands and suppliers when suggesting specific products
 
-    - Disease management
-    - Best agronomic practices for yield
-    - Important precautions and crop requirements
-    - Fertilizer and input recommendations
-    - Risks/general crop care tips
+- For each method, explain when/why it may be preferable in Indian conditions, with relevant precautions for Indian climate.
+- Always offer both modern (chemical) and traditional/natural Indian farming solutions unless the question strictly forbids one or the other.
 
-### To keep responses concise and focused, the answer should:
+### Additional Guidance for Indian Crop Management Questions
+- If questions relate to growing specific crops, focus on Indian varieties and cultivation practices suited to Indian conditions.
+- Provide information about:
+    - Indian crop varieties and their regional suitability
+    - Soil preparation techniques for Indian soil types
+    - Irrigation methods suitable for Indian water conditions
+    - Pest and disease management using Indian-available solutions
+    - Fertilizer recommendations based on Indian soil testing and availability
+    - Harvest and post-harvest handling for Indian market conditions
 
-    - Only address the specific question asked, using clear bullet points, tables, or short sub-headings as needed.
-    - Make sure explanations are actionable, practical, and relevant for farmers—avoiding lengthy background or scientific context unless requested.
-    - For questions about diseases, fertilizers, fungicides, or tonics:
-    - Briefly provide both standard (chemical) and quick low-cost/natural solutions, each with a very short explanation and clear usage or caution notes.
-    - For broader crop management questions, summarize key data points (disease management, input use, care tips, risks) in a succinct, easy-to-use manner—only including what's relevant to the query.
-    - Never add unrelated information, avoid detailed paragraphs unless multiple issues are asked, and always keep the response direct and farmer-friendly.
-
-- Even if the information does not directly match the question, use context and reasoning to include database/web data points that could help answer the user’s general query about that crop.
-- Synthesize relevant knowledge and sources into a complete, actionable answer.
+### Regional Context Requirements:
+- Always consider the diversity of Indian agriculture across different states and regions
+- Provide region-specific advice when possible (North vs South India, coastal vs inland, plains vs hills)
+- Reference local Indian agricultural practices and traditional knowledge
+- Consider local Indian market conditions and crop pricing
 
 ### User Question
 {question}
 
-{web_results}
-
 ---
-### Your Answer:
+### Your Answer (India-Specific):
 """
 
-    def __init__(self, google_api_key, model: str, websearch_tool, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(
             name="fallback_agri_tool",
-            description="Fallback LLM+websearch tool for general agricultural answering.",
+            description="Fallback LLM tool for general agricultural answering.",
             **kwargs
         )
-        genai.configure(api_key=google_api_key)
-        self._llm_model = genai.GenerativeModel(model)
-        self._websearch_tool = websearch_tool
 
-    def _run(self, question: str) -> str:
+    def _run(self, question: str, conversation_history: Optional[List[Dict]] = None) -> str:
         print(f"[DEBUG] FallbackAgriTool called with question: {question}")
+        print(f"[DEBUG] FallbackAgriTool received conversation history: {len(conversation_history) if conversation_history else 0} entries")
         
-        web_results = self._websearch_tool._run(question, limit=2)
-        web_results_str = f"\nWeb search results:\n{web_results}\n" if web_results else ""
-        prompt = self.FALLBACK_PROMPT.format(question=question, web_results=web_results_str)
-        response = self._llm_model.generate_content(
-            contents=prompt,
-            generation_config=genai.GenerationConfig(
-                temperature=0.4,
-                max_output_tokens=4096,
-            )
-        )
+        if conversation_history and len(conversation_history) > 0:
+            recent_context = []
+            
+            for entry in conversation_history[-2:]:
+                q = entry.get('question', '')
+                a = entry.get('answer', '')
+                recent_context.append(f"User: {q}")
+                recent_context.append(f"Assistant: {a}")
+            
+            context_text = "\n".join(recent_context)
+            
+            enhanced_prompt = f"""Here's our recent conversation:
+{context_text}
+
+Now the user asks: {question}
+
+Please respond naturally, understanding what they're referring to from our conversation context."""
+
+            prompt = enhanced_prompt
+        else:
+            prompt = f"User asks: {question}\n\nPlease respond as an agricultural expert."
+            
+        response_text = run_local_llm(prompt, use_fallback=True)
         
-        final_answer = "Source: LLM knowledge & Web Search\n\n" + response.text.strip()
-        
-        log_fallback_to_csv(question, final_answer)
+        print(f"[SOURCE] Local LLM used for question: {question}")
+        log_fallback_to_csv(question, response_text)
         print(f"[DEBUG] Logged fallback call to CSV")
         
-        return final_answer
+        return response_text.strip()
 
 

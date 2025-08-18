@@ -172,7 +172,15 @@ async function toggleSessionStatus(session_id, currentStatus) {
     document.getElementById("exportBtn").style.display = "none";
     document.getElementById("startScreen").style.display = "block";
   } else {
-    const resp = await fetch(`${API_BASE}/session/${session_id}`);
+    const headers = {};
+    // Add ngrok bypass header if using ngrok
+    if (API_BASE.includes('ngrok')) {
+      headers["ngrok-skip-browser-warning"] = "true";
+    }
+
+    const resp = await fetch(`${API_BASE}/session/${session_id}`, {
+      headers: headers
+    });
     const { session } = await resp.json();
     currentSession = session;
     document.getElementById("viewToggleText").textContent = "Active";
@@ -186,8 +194,16 @@ async function toggleSessionStatus(session_id, currentStatus) {
 async function deleteSession(session_id) {
   const confirmed = confirm("Are you sure you want to delete this session?");
   if (!confirmed) return;
+
+  const headers = {};
+  // Add ngrok bypass header if using ngrok
+  if (API_BASE.includes('ngrok')) {
+    headers["ngrok-skip-browser-warning"] = "true";
+  }
+
   await fetch(`${API_BASE}/delete-session/${session_id}`, {
-    method: "DELETE"
+    method: "DELETE",
+    headers: headers
   });
   if (currentSession?.session_id === session_id) {
     currentSession = null;
@@ -207,8 +223,15 @@ async function rateAnswer(index, rating, btn) {
   formData.append("question_index", index);
   formData.append("rating", rating);
 
+  const headers = {};
+  // Add ngrok bypass header if using ngrok
+  if (API_BASE.includes('ngrok')) {
+    headers["ngrok-skip-browser-warning"] = "true";
+  }
+
   await fetch(`${API_BASE}/session/${currentSession.session_id}/rate`, {
     method: "POST",
+    headers: headers,
     body: formData,
   });
 
@@ -293,6 +316,48 @@ function appendMessage(sender, text, index = null, rating = null) {
   document.getElementById("chatWindow").appendChild(div);
 }
 
+function displayRecommendations(recommendations) {
+  // Remove any existing recommendations first
+  const existingRecs = document.querySelectorAll('.inline-recommendations');
+  existingRecs.forEach(rec => rec.remove());
+
+  if (!recommendations || recommendations.length === 0) {
+    return;
+  }
+
+  // Create inline recommendations div
+  const recDiv = document.createElement("div");
+  recDiv.className = "inline-recommendations";
+  recDiv.innerHTML = `
+    <div class="inline-rec-header">
+      <i class="fas fa-lightbulb"></i>
+      <span>You might also ask:</span>
+    </div>
+    <div class="inline-rec-items">
+      ${recommendations.map(rec => `
+        <div class="inline-rec-item" data-question="${rec.question}">
+          <span class="inline-rec-question">${rec.question}</span>
+          <span class="inline-rec-score">${(rec.similarity_score * 100).toFixed(0)}%</span>
+        </div>
+      `).join('')}
+    </div>
+  `;
+
+  // Add click handlers to recommendation items
+  recDiv.addEventListener('click', (e) => {
+    const item = e.target.closest('.inline-rec-item');
+    if (item) {
+      const question = item.getAttribute('data-question');
+      document.getElementById("user-input").value = question;
+      document.getElementById("user-input").focus();
+    }
+  });
+
+  // Insert after the last bot message
+  const chatWindow = document.getElementById("chatWindow");
+  chatWindow.appendChild(recDiv);
+  chatWindow.scrollTop = chatWindow.scrollHeight;
+}
 
 function loadChat(session) {
   document.getElementById("startScreen").style.display = "none";
@@ -328,6 +393,13 @@ function loadChat(session) {
     appendMessage("bot", msg.answer, idx, msg.rating || null);
   });
 
+  // Show recommendations if available (using new inline style)
+  if (session.recommendations && session.recommendations.length > 0) {
+    displayRecommendations(session.recommendations);
+  }
+
+  // Hide the old recommendations section since we're using inline style
+  document.getElementById("recommendationsSection").style.display = "none";
 
   document.getElementById("chatWindow").scrollTop = document.getElementById("chatWindow").scrollHeight;
 }
@@ -375,6 +447,9 @@ window.addEventListener("DOMContentLoaded", () => {
     //     //   return;
     //     // }
     //     localStorage.setItem("agrichat_user_state", state); 
+    // (NEW) After the audioBlob is ready...
+    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' }); // or another appropriate MIME type
+
 
 
     console.log("Start form found:", document.getElementById("start-form"));
@@ -400,10 +475,17 @@ window.addEventListener("DOMContentLoaded", () => {
     formData.append("device_id", deviceId);
     formData.append("state", state);
     formData.append("language", lang);
+    formData.append("file", audioBlob, "recording.webm");
+    const headers = {};
+    // Add ngrok bypass header if using ngrok
+    if (API_BASE.includes('ngrok')) {
+      headers["ngrok-skip-browser-warning"] = "true";
+    }
 
     showLoader();
     const res = await fetch(`${API_BASE}/query`, {
       method: "POST",
+      headers: headers,
       body: formData,
     });
 
@@ -430,15 +512,30 @@ window.addEventListener("DOMContentLoaded", () => {
     formData.append("device_id", deviceId);
     formData.append("state", localStorage.getItem("agrichat_user_state") || "");
 
+    const headers = {};
+    // Add ngrok bypass header if using ngrok
+    if (API_BASE.includes('ngrok')) {
+      headers["ngrok-skip-browser-warning"] = "true";
+    }
+
     showLoader();
     const res = await fetch(`${API_BASE}/session/${currentSession.session_id}/query`, {
       method: "POST",
+      headers: headers,
       body: formData,
     });
     const data = await res.json();
     const last = data.session.messages.at(-1);
     hideLoader();
     appendMessage("bot", last.answer);
+
+    // Update current session with new data including recommendations
+    currentSession = data.session;
+
+    // Show updated recommendations if available (using new inline style)
+    if (currentSession.recommendations && currentSession.recommendations.length > 0) {
+      displayRecommendations(currentSession.recommendations);
+    }
   });
 
   document.getElementById("restoreBtn").addEventListener("click", async () => {
@@ -456,11 +553,48 @@ window.addEventListener("DOMContentLoaded", () => {
 });
 
 function showLoader() {
-  document.getElementById("loadingOverlay").style.display = "flex";
+  const loadingOverlay = document.getElementById("loadingOverlay");
+  loadingOverlay.style.display = "flex";
+
+  let thinkingText = document.getElementById("thinkingText");
+  if (!thinkingText) {
+    thinkingText = document.createElement("div");
+    thinkingText.id = "thinkingText";
+    thinkingText.style.cssText = `
+      color: #4CAF50;
+      font-size: 16px;
+      margin-top: 20px;
+      text-align: center;
+      font-weight: 500;
+    `;
+    loadingOverlay.appendChild(thinkingText);
+  }
+
+  const thinkingStates = [
+    "Understanding your question...",
+    "Searching agricultural database...",
+    "Processing with AI...",
+    "Generating response..."
+  ];
+
+  let currentState = 0;
+  thinkingText.textContent = thinkingStates[0];
+
+
+  loadingOverlay.thinkingInterval = setInterval(() => {
+    currentState = (currentState + 1) % thinkingStates.length;
+    thinkingText.textContent = thinkingStates[currentState];
+  }, 1500);
 }
 
 function hideLoader() {
-  document.getElementById("loadingOverlay").style.display = "none";
+  const loadingOverlay = document.getElementById("loadingOverlay");
+  loadingOverlay.style.display = "none";
+
+  if (loadingOverlay.thinkingInterval) {
+    clearInterval(loadingOverlay.thinkingInterval);
+    loadingOverlay.thinkingInterval = null;
+  }
 }
 
 async function detectLocationAndLanguage(updateBackend = false) {
@@ -592,7 +726,7 @@ async function handleVoiceInput(targetTextarea) {
 
 async function startRecording(targetTextarea) {
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ 
+    const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         sampleRate: 16000,
         channelCount: 1,
@@ -618,7 +752,7 @@ async function startRecording(targetTextarea) {
 
     mediaRecorder.onstop = async () => {
       isRecording = false;
-      updateVoiceButtonState(false, true); 
+      updateVoiceButtonState(false, true);
       stream.getTracks().forEach(track => track.stop());
 
       try {
@@ -677,8 +811,15 @@ async function transcribeAudio(audioBlob) {
   const formData = new FormData();
   formData.append('file', audioBlob, 'recording.webm');
 
+  const headers = {};
+  // Add ngrok bypass header if using ngrok
+  if (API_BASE.includes('ngrok')) {
+    headers["ngrok-skip-browser-warning"] = "true";
+  }
+
   const response = await fetch(`${API_BASE}/transcribe-audio`, {
     method: 'POST',
+    headers: headers,
     body: formData
   });
 

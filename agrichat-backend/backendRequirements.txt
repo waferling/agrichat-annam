@@ -8,13 +8,14 @@ langchain-community
 chromadb
 beautifulsoup4
 markdown
+torch
+torchaudio
 numpy
 python-multipart
 gunicorn
-langchain_google_genai
-google.generativeai
+scikit-learn
 certifi
 pytz
 python-dateutil
 crewai
-firecrawl-py
+openai-whisper
